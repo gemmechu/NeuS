@@ -7,6 +7,7 @@ from glob import glob
 from icecream import ic
 from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
+import json
 
 
 # This function is borrowed from IDR: https://github.com/lioryariv/idr
@@ -46,36 +47,50 @@ class Dataset:
         self.object_cameras_name = conf.get_string('object_cameras_name')
 
         self.camera_outside_sphere = conf.get_bool('camera_outside_sphere', default=True)
-        self.scale_mat_scale = conf.get_float('scale_mat_scale', default=1.1)
+        # self.scale_mat_scale = conf.get_float('scale_mat_scale', default=1.1)
 
-        camera_dict = np.load(os.path.join(self.data_dir, self.render_cameras_name))
+
+        camera_dict = json.load(open(os.path.join(self.data_dir, "cam_dict_norm.json")))
+        for x in list(camera_dict.keys()):
+            x = x[:-4] + ".png"
+            camera_dict[x]["K"] = np.array(camera_dict[x]["K"]).reshape((4, 4))
+            camera_dict[x]["W2C"] = np.array(camera_dict[x]["W2C"]).reshape((4, 4))
+
         self.camera_dict = camera_dict
-        self.images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
+
+      
+        self.images_lis = sorted(glob(os.path.join(self.data_dir, "image/*.png")))
         self.n_images = len(self.images_lis)
-        self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 256.0
-        self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
-        self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
+        self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 255.0
+        
+        # no_mask = True
+        
+        self.masks_lis = sorted(glob(os.path.join(self.data_dir, "mask/*.png")))
+        self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 255.0
+           
 
-        # world_mat is a projection matrix from world to image
-        self.world_mats_np = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
-
-        self.scale_mats_np = []
+        self.images_np = self.images_np[..., :3]
+        self.masks_np = self.masks_np[..., :3]
 
         # scale_mat: used for coordinate normalization, we assume the scene to render is inside a unit sphere at origin.
-        self.scale_mats_np = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
+        self.scale_mats_np = [np.eye(4).astype(np.float32) for idx in range(self.n_images)]
 
         self.intrinsics_all = []
         self.pose_all = []
-
-        for scale_mat, world_mat in zip(self.scale_mats_np, self.world_mats_np):
-            P = world_mat @ scale_mat
-            P = P[:3, :4]
-            intrinsics, pose = load_K_Rt_from_P(None, P)
-            self.intrinsics_all.append(torch.from_numpy(intrinsics).float())
-            self.pose_all.append(torch.from_numpy(pose).float())
+        self.world_mats_np = []
+        for x in self.images_lis:
+            x = os.path.basename(x)[:-4] + ".png"
+            K = self.camera_dict[x]["K"].astype(np.float32)
+            W2C = self.camera_dict[x]["W2C"].astype(np.float32)
+            C2W = np.linalg.inv(self.camera_dict[x]["W2C"]).astype(np.float32)
+            self.intrinsics_all.append(torch.from_numpy(K))
+            self.pose_all.append(torch.from_numpy(C2W))
+            self.world_mats_np.append(W2C)
 
         self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()  # [n_images, H, W, 3]
-        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()   # [n_images, H, W, 3]
+        self.masks = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()  # [n_images, H, W, 3]
+        print("image shape, mask shape: ", self.images.shape, self.masks.shape)
+        print("image pixel range: ", self.images.min().item(), self.images.max().item())
         self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)   # [n_images, 4, 4]
         self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)  # [n_images, 4, 4]
         self.focal = self.intrinsics_all[0][0, 0]
@@ -86,7 +101,8 @@ class Dataset:
         object_bbox_min = np.array([-1.01, -1.01, -1.01, 1.0])
         object_bbox_max = np.array([ 1.01,  1.01,  1.01, 1.0])
         # Object scale mat: region of interest to **extract mesh**
-        object_scale_mat = np.load(os.path.join(self.data_dir, self.object_cameras_name))['scale_mat_0']
+        # object_scale_mat = np.load(os.path.join(self.data_dir, self.object_cameras_name))['scale_mat_0']
+        object_scale_mat = np.eye(4).astype(np.float32)
         object_bbox_min = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_min[:, None]
         object_bbox_max = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_max[:, None]
         self.object_bbox_min = object_bbox_min[:3, 0]
