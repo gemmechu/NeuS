@@ -1,0 +1,6 @@
+/usr/local/cuda/bin/:/home/gmh72/anaconda3/envs/iron/bin/:/home/gmh72/.local_utils:/home/gmh72/anaconda3/bin:/home/gmh72/anaconda3/condabin:/home/gmh72/.vscode-server/bin/784b0177c56c607789f9638da7b6bf3230d47a8c/bin/remote-cli:/usr/local/slurm/current/bin:/usr/local/slurm/current/sbin:/usr/local/openmpi/current/bin:/usr/local/openmpi/current:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+Hello Wooden
+Load data: Begin
+image shape, mask shape:  torch.Size([90, 720, 1080, 3]) torch.Size([90, 720, 1080, 3])
+image pixel range:  0.0 0.9647058844566345
+Load data: End

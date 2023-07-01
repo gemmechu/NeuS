@@ -1,0 +1,18 @@
+#!/bin/bash
+#SBATCH -J block_simple                     # Job name
+#SBATCH -o jobs/test_file_%j.out                  # output file (%j expands to jobID)
+#SBATCH -e jobs/test_file_%j.err                  # error log file (%j expands to jobID)
+#SBATCH --mail-type=ALL                      # Request status by email 
+#SBATCH --mail-user=gmh72@cornell.edu        # Email address to send results to.
+#SBATCH -N 1                                 # Total number of nodes requested
+#SBATCH -n 5                                 # Total number of cores requested
+#SBATCH --get-user-env                       # retrieve the users login environment 
+#SBATCH --mem=50G                           # server memory requested (per node)
+#SBATCH -t 168:00:00                           # Time limit (hh:mm:ss)
+#SBATCH --partition=hariharan       # Request partition
+#SBATCH --gres=gpu:1                 # Type/number of GPUs needed
+export PATH=/usr/local/cuda/bin/:/home/gmh72/anaconda3/envs/iron/bin/:$PATH
+echo $PATH
+case=block_simple
+
+python exp_runner.py --mode train --conf ./confs/wmask.conf --case ${case}
