@@ -12,7 +12,7 @@ from shutil import copyfile
 from icecream import ic
 from tqdm import tqdm
 from pyhocon import ConfigFactory
-from NeuS.models.dataset_json import Dataset
+from models.dataset import Dataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
 from models.renderer import NeuSRenderer
 
@@ -60,18 +60,26 @@ class Runner:
         # Networks
         params_to_train = []
         self.nerf_outside = NeRF(**self.conf['model.nerf']).to(self.device)
-        self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
+        self.sdf_network_1 = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
+        self.sdf_network_2 = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
        
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
         self.color_network = RenderingNetwork(**self.conf['model.rendering_network']).to(self.device)
         params_to_train += list(self.nerf_outside.parameters())
-        params_to_train += list(self.sdf_network.parameters())
+        params_to_train += list(self.sdf_network_1.parameters())
+        params_to_train += list(self.sdf_network_2.parameters())
         params_to_train += list(self.deviation_network.parameters())
         params_to_train += list(self.color_network.parameters())
 
         self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
-        self.renderer = NeuSRenderer(self.nerf_outside,
-                                    self.sdf_network,
+        self.renderer_1 = NeuSRenderer(self.nerf_outside,
+                                    self.sdf_network_1,
+                                    self.deviation_network,
+                                    self.color_network,
+                                    **self.conf['model.neus_renderer'])
+
+        self.renderer_2 = NeuSRenderer(self.nerf_outside,
+                                    self.sdf_network_2,
                                     self.deviation_network,
                                     self.color_network,
                                     **self.conf['model.neus_renderer'])
@@ -97,6 +105,44 @@ class Runner:
             self.file_backup()
 
     def train(self):
+        def get_loss(render_out, mask, mask_other, num):
+            mask_sum = mask.sum() + 1e-5
+
+            color_fine = render_out['color_fine']
+            s_val = render_out['s_val']
+            cdf_fine = render_out['cdf_fine']
+            gradient_error = render_out['gradient_error']
+            weight_max = render_out['weight_max']
+            weight_sum = render_out['weight_sum']
+
+            # Loss
+            color_error = (color_fine - true_rgb) * mask
+            color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
+            psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask_sum * 3.0)).sqrt())
+
+            eikonal_loss = gradient_error
+            weight_sum = weight_sum.clip(1e-3, 1.0 - 1e-3)
+            mask_clone = mask.clone()
+            weight_sum_clone = weight_sum.clone().detach()
+            mask_clone[mask_other == 1] = weight_sum_clone[mask_other == 1]
+            mask_loss = F.binary_cross_entropy(weight_sum, mask_clone)
+             # mask_loss = mask_loss * (1- mask_other)
+
+            loss = color_fine_loss +\
+                   eikonal_loss * self.igr_weight +\
+                   mask_loss * self.mask_weight
+
+            num = str(num)
+
+            self.writer.add_scalar('Loss/loss_{num}', loss, self.iter_step)
+            self.writer.add_scalar('Loss/color_loss_{num}', color_fine_loss, self.iter_step)
+            self.writer.add_scalar('Loss/eikonal_loss_{num}', eikonal_loss, self.iter_step)
+            self.writer.add_scalar('Statistics/s_val_{num}', s_val.mean(), self.iter_step)
+            self.writer.add_scalar('Statistics/cdf_{num}', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
+            self.writer.add_scalar('Statistics/weight_max_{num}', (weight_max * mask).sum() / mask_sum, self.iter_step)
+            self.writer.add_scalar('Statistics/psnr_{num}', psnr, self.iter_step)
+            return loss
+
         self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
         self.update_learning_rate()
         res_step = self.end_iter - self.iter_step
@@ -105,70 +151,48 @@ class Runner:
         for iter_i in tqdm(range(res_step)):
             data = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
 
-            rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
+            rays_o, rays_d, true_rgb, mask_1, mask_2 = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10],data[:, 10: 11]
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
 
             background_rgb = None
-            if self.use_white_bkgd:
-                background_rgb = torch.ones([1, 3])
+            mask_1 = (mask_1 > 0.5).float()
+            mask_2 = (mask_2 > 0.5).float()
+        
 
-            if self.mask_weight > 0.0:
-                mask = (mask > 0.5).float()
-            else:
-                mask = torch.ones_like(mask)
-
-            mask_sum = mask.sum() + 1e-5
-            render_out = self.renderer.render(rays_o, rays_d, near, far,
+            render_out_1 = self.renderer_1.render(rays_o, rays_d, near, far,
+                                              background_rgb=background_rgb,
+                                              cos_anneal_ratio=self.get_cos_anneal_ratio())
+            render_out_2 = self.renderer_2.render(rays_o, rays_d, near, far,
                                               background_rgb=background_rgb,
                                               cos_anneal_ratio=self.get_cos_anneal_ratio())
             
-            color_fine = render_out['color_fine']
-            s_val = render_out['s_val']
-            cdf_fine = render_out['cdf_fine']
-            gradient_error = render_out['gradient_error']
-            weight_max = render_out['weight_max']
-            weight_sum = render_out['weight_sum']
             
+            loss_1= get_loss(render_out_1, mask_1, mask_2, num=1)
             
-            # Loss
-            color_error = (color_fine - true_rgb) * mask
-            color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
-            psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask_sum * 3.0)).sqrt())
+            loss_2= get_loss(render_out_2, mask_2, mask_1, num=2)
 
-            eikonal_loss = gradient_error
-
-            mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
-
-            loss = color_fine_loss +\
-                   eikonal_loss * self.igr_weight +\
-                   mask_loss * self.mask_weight
-
+            
             self.optimizer.zero_grad()
-            loss.backward()
+            loss_1.backward()
+            loss_2.backward()
             self.optimizer.step()
 
             self.iter_step += 1
 
-            self.writer.add_scalar('Loss/loss', loss, self.iter_step)
-            self.writer.add_scalar('Loss/color_loss', color_fine_loss, self.iter_step)
-            self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
-            self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
-            self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
-            self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
-            self.writer.add_scalar('Statistics/psnr', psnr, self.iter_step)
-
             if self.iter_step % self.report_freq == 0:
                 print(self.base_exp_dir)
-                print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
+                print('iter:{:8>d} loss_1 = {} loss_2 = {} lr={}'.format(self.iter_step, loss_1, loss_2, self.optimizer.param_groups[0]['lr']))
 
             if self.iter_step % self.save_freq == 0:
                 self.save_checkpoint()
 
             if self.iter_step % self.val_freq == 0:
-                self.validate_image()
+                self.validate_image(renderer= self.renderer_1, num="1")
+                self.validate_image(renderer= self.renderer_2, num="2")
 
             if self.iter_step % self.val_mesh_freq == 0:
-                self.validate_mesh()
+                self.validate_mesh(renderer=self.renderer_1, num="1")
+                self.validate_mesh(renderer=self.renderer_2, num="2")
 
             self.update_learning_rate()
 
@@ -211,7 +235,8 @@ class Runner:
     def load_checkpoint(self, checkpoint_name):
         checkpoint = torch.load(os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name), map_location=self.device)
         self.nerf_outside.load_state_dict(checkpoint['nerf'])
-        self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
+        self.sdf_network_1.load_state_dict(checkpoint['sdf_network_fine_1'])
+        self.sdf_network_2.load_state_dict(checkpoint['sdf_network_fine_2'])
         self.deviation_network.load_state_dict(checkpoint['variance_network_fine'])
         self.color_network.load_state_dict(checkpoint['color_network_fine'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
@@ -222,7 +247,8 @@ class Runner:
     def save_checkpoint(self):
         checkpoint = {
             'nerf': self.nerf_outside.state_dict(),
-            'sdf_network_fine': self.sdf_network.state_dict(),
+            'sdf_network_fine_1': self.sdf_network_1.state_dict(),
+            'sdf_network_fine_2': self.sdf_network_2.state_dict(),
             'variance_network_fine': self.deviation_network.state_dict(),
             'color_network_fine': self.color_network.state_dict(),
             'optimizer': self.optimizer.state_dict(),
@@ -232,7 +258,7 @@ class Runner:
         os.makedirs(os.path.join(self.base_exp_dir, 'checkpoints'), exist_ok=True)
         torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', 'ckpt_{:0>6d}.pth'.format(self.iter_step)))
 
-    def validate_image(self, idx=-1, resolution_level=-1):
+    def validate_image(self, idx=-1, resolution_level=-1, renderer= None, num=None):
         if idx < 0:
             idx = np.random.randint(self.dataset.n_images)
 
@@ -252,7 +278,7 @@ class Runner:
             near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
             background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
 
-            render_out = self.renderer.render(rays_o_batch,
+            render_out = renderer.render(rays_o_batch,
                                               rays_d_batch,
                                               near,
                                               far,
@@ -264,7 +290,7 @@ class Runner:
             if feasible('color_fine'):
                 out_rgb_fine.append(render_out['color_fine'].detach().cpu().numpy())
             if feasible('gradients') and feasible('weights'):
-                n_samples = self.renderer.n_samples + self.renderer.n_importance
+                n_samples = renderer.n_samples + renderer.n_importance
                 normals = render_out['gradients'] * render_out['weights'][:, :n_samples, None]
                 if feasible('inside_sphere'):
                     normals = normals * render_out['inside_sphere'][..., None]
@@ -290,16 +316,16 @@ class Runner:
             if len(out_rgb_fine) > 0:
                 cv.imwrite(os.path.join(self.base_exp_dir,
                                         'validations_fine',
-                                        '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
+                                        '{}_{:0>8d}_{}_{}.png'.format(num, self.iter_step, i, idx)),
                            np.concatenate([img_fine[..., i],
                                            self.dataset.image_at(idx, resolution_level=resolution_level)]))
             if len(out_normal_fine) > 0:
                 cv.imwrite(os.path.join(self.base_exp_dir,
                                         'normals',
-                                        '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
+                                        '{}_{:0>8d}_{}_{}.png'.format(num, self.iter_step, i, idx)),
                            normal_img[..., i])
 
-    def render_novel_image(self, idx_0, idx_1, ratio, resolution_level):
+    def render_novel_image(self, idx_0, idx_1, ratio, resolution_level,renderer):
         """
         Interpolate view between two cameras.
         """
@@ -313,7 +339,7 @@ class Runner:
             near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
             background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
 
-            render_out = self.renderer.render(rays_o_batch,
+            render_out = renderer.render(rays_o_batch,
                                               rays_d_batch,
                                               near,
                                               far,
@@ -327,19 +353,19 @@ class Runner:
         img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 256).clip(0, 255).astype(np.uint8)
         return img_fine
 
-    def validate_mesh(self, world_space=False, resolution=64, threshold=0.0):
+    def validate_mesh(self, world_space=False, resolution=64, threshold=0.0, renderer=None, num='b'):
         bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)
         bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32)
 
         vertices, triangles =\
-            self.renderer.extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold)
+            renderer.extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold)
         os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
 
         if world_space:
             vertices = vertices * self.dataset.scale_mats_np[0][0, 0] + self.dataset.scale_mats_np[0][:3, 3][None]
 
         mesh = trimesh.Trimesh(vertices, triangles)
-        mesh.export(os.path.join(self.base_exp_dir, 'meshes', '{:0>8d}.ply'.format(self.iter_step)))
+        mesh.export(os.path.join(self.base_exp_dir, 'meshes', '{}_{:0>8d}.ply'.format(num, self.iter_step)))
 
         logging.info('End')
 
@@ -378,12 +404,12 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG, format=FORMAT)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--conf', type=str, default='./confs/base.conf')
+    parser.add_argument('--conf', type=str, default='./confs/wmask.conf')
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--mcube_threshold', type=float, default=0.0)
-    parser.add_argument('--is_continue', default=False, action="store_true")
+    parser.add_argument('--is_continue', default=True, action="store_true")
     parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--case', type=str, default='')
+    parser.add_argument('--case', type=str, default='two_cars_envs')
 
     args = parser.parse_args()
 

@@ -6,6 +6,29 @@ from models.embedder import get_embedder
 
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
+class MultiSDFNetwork(nn.Module):
+    def __init__(self, sdf_network1, sdf_network2):
+        super(MultiSDFNetwork, self).__init__()
+        self.sdf_network1 = sdf_network1
+        self.sdf_network2 = sdf_network2
+
+    def forward(self, inputs):
+        sdf1 = self.sdf_network1.sdf(inputs)
+        sdf2 = self.sdf_network2.sdf(inputs)
+        return sdf1, sdf2
+
+    def sdf(self, x):
+        sdf1, sdf2 = self.forward(x)
+        return sdf1, sdf2
+
+    def sdf_hidden_appearance(self, x):
+        sdf_hidden1, sdf_hidden2 = self.forward(x)
+        return sdf_hidden1, sdf_hidden2
+
+    def gradient(self, x):
+        gradients1 = self.sdf_network1.gradient(x)
+        gradients2 = self.sdf_network2.gradient(x)
+        return gradients1, gradients2
 class SDFNetwork(nn.Module):
     def __init__(self,
                  d_in,
